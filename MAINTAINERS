@@ -2964,6 +2964,12 @@ F: hw/vmapple/*
 F: include/hw/vmapple/*
 F: docs/system/arm/vmapple.rst
 
+mac-qfb
+M: Solra Bizna <solra@bizna.name>
+S: Odd Fixes
+F: hw/m68k/mac_qfb.c
+F: include/hw/m68k/mac_qfb.h
+
 Subsystems
 ----------
 Overall Audio backends

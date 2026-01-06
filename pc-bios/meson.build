@@ -85,6 +85,7 @@ blobs = [
   'npcm8xx_bootrom.bin',
   'vof.bin',
   'vof-nvram.bin',
+  'mac_qfb.rom',
 ]
 
 if get_option('install_blobs')

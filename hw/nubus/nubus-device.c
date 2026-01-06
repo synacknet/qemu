@@ -25,15 +25,76 @@ void nubus_set_irq(NubusDevice *nd, int level)
     qemu_set_irq(nubus->irqs[nd->slot], level);
 }
 
+static uint8_t *nubus_rom_address(DeviceState *dev,
+                                  NubusDevice *nd,
+                                  int64_t size)
+{
+    uint8_t *rom_ptr;
+    int64_t align_size;
+
+    char *name = g_strdup_printf("nubus-slot-%x-declaration-rom", nd->slot);
+
+    /*
+     * Ensure ROM memory region is aligned to target page size regardless
+     * of the size of the Declaration ROM image
+     */
+    align_size = ROUND_UP(size, qemu_target_page_size());
+    memory_region_init_rom(&nd->decl_rom, OBJECT(dev), name, align_size,
+                           &error_abort);
+    g_free(name);
+    rom_ptr = memory_region_get_ram_ptr(&nd->decl_rom);
+
+    memory_region_add_subregion(&nd->slot_mem, NUBUS_SLOT_SIZE - align_size,
+                                &nd->decl_rom);
+
+    return rom_ptr + (uintptr_t)(align_size - size);
+}
+
+static uint8_t *nubus_rom_lane_adjusted(DeviceState *dev,
+                                        NubusDevice *nd,
+                                        gchar *romdata,
+                                        gsize romsize)
+{
+    uint8_t *rom_ptr = NULL;
+    uint8_t bytelanes = romdata[romsize - 1];
+    int64_t size = 0;
+    int64_t i, c;
+    uint8_t validate;
+    int8_t lanescount = ctpop8(bytelanes & 0x0F);
+
+    validate = (~(bytelanes & 0x0F) << 4) | (bytelanes & 0x0F);
+    if (validate != bytelanes) {
+        printf("bytelanes not valid: %x\n", bytelanes);
+        return NULL;
+    }
+
+    size = ROUND_UP((romsize * 4) / lanescount, 4);
+    rom_ptr = nubus_rom_address(dev, nd, size);
+    for (i = 0, c = 0; i < romsize; i++, c += 4) {
+        int setlanes = 0;
+        for (int lane = 0; lane < 4; lane++) {
+            if (bytelanes & (1 << lane)) {
+                if ((i + setlanes) < romsize) {
+                    rom_ptr[c + lane] = romdata[i + setlanes];
+                    setlanes++;
+                }
+            }
+        }
+        i += (lanescount - 1);
+    }
+
+    return rom_ptr;
+}
+
 static void nubus_device_realize(DeviceState *dev, Error **errp)
 {
     NubusBus *nubus = NUBUS_BUS(qdev_get_parent_bus(dev));
     NubusDevice *nd = NUBUS_DEVICE(dev);
     char *name, *path;
     hwaddr slot_offset;
-    int64_t size, align_size;
     uint8_t *rom_ptr;
-    int ret;
+    gchar *romdata;
+    gsize romsize;
 
     if (nd->slot < 0 || nd->slot >= NUBUS_SLOT_NB) {
         error_setg(errp,
@@ -68,42 +129,28 @@ static void nubus_device_realize(DeviceState *dev, Error **errp)
             path = g_strdup(nd->romfile);
         }
 
-        size = get_image_size(path, NULL);
-        if (size < 0) {
+        if (!g_file_get_contents(path, &romdata, &romsize, NULL)) {
             error_setg(errp, "failed to find romfile \"%s\"", nd->romfile);
             g_free(path);
             return;
-        } else if (size == 0) {
+        } else if (romsize == 0) {
             error_setg(errp, "romfile \"%s\" is empty", nd->romfile);
             g_free(path);
             return;
-        } else if (size > NUBUS_DECL_ROM_MAX_SIZE) {
+        } else if (romsize > NUBUS_DECL_ROM_MAX_SIZE) {
             error_setg(errp, "romfile \"%s\" too large (maximum size 128K)",
                        nd->romfile);
             g_free(path);
             return;
         }
 
-        name = g_strdup_printf("nubus-slot-%x-declaration-rom", nd->slot);
-
-        /*
-         * Ensure ROM memory region is aligned to target page size regardless
-         * of the size of the Declaration ROM image
-         */
-        align_size = ROUND_UP(size, qemu_target_page_size());
-        memory_region_init_rom(&nd->decl_rom, OBJECT(dev), name, align_size,
-                               &error_abort);
-        rom_ptr = memory_region_get_ram_ptr(&nd->decl_rom);
-        ret = load_image_size(path, rom_ptr + (uintptr_t)(align_size - size),
-                              size);
+        rom_ptr = nubus_rom_lane_adjusted(dev, nd, romdata, romsize);
         g_free(path);
-        g_free(name);
-        if (ret < 0) {
+        g_free(romdata);
+        if (!rom_ptr) {
             error_setg(errp, "could not load romfile \"%s\"", nd->romfile);
             return;
         }
-        memory_region_add_subregion(&nd->slot_mem, NUBUS_SLOT_SIZE - align_size,
-                                    &nd->decl_rom);
     }
 }
 

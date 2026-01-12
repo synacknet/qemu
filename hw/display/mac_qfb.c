@@ -25,9 +25,17 @@
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 
+/*
+ *  Slot space layout:
+ *  $FXFFD000 - $FXFFFFFF decl rom
+ *  $FXF01000 - $FXFFCFFF unused / for declrom growth
+ *  $FX001000 - $FX0F0FFF vram alias
+ *  $FX000040 - $FX000FFF unused
+ *  $FX000000 - $FX00003F control registers
+ */
 #define VIDEO_SUPER_BASE    0x0000000
 #define VIDEO_ALIAS_BASE    0x001000
-#define VIDEO_ALIAS_SIZE    0xFFF000
+#define VIDEO_ALIAS_SIZE    0xF00000
 #define QFB_BASE            0x000000
 
 #define QFB_VRAM_SIZE       (32 * MiB) /* enough for 3840x2160 at 32-bit */
@@ -714,10 +722,6 @@ static bool qfb_common_realize(DeviceState *dev, QfbState *s, Error **errp)
 {
     NubusDevice *nd = NUBUS_DEVICE(dev);
     DisplaySurface *surface;
-    char *path;
-    int64_t size;
-    int fd;
-    uint8_t *ptr;
 
     if (s->width < 32) s->width = 640;
     else if (s->width > QFB_MAX_WIDTH) s->width = QFB_MAX_WIDTH;
@@ -746,50 +750,7 @@ static bool qfb_common_realize(DeviceState *dev, QfbState *s, Error **errp)
         return false;
     }
 
-    /* Install the declaration ROM. (We can't use the support in nubus-device
-       for this because we need to patch the ROM before the system boots, and
-       QEMU's architecture makes that rather hard.) */
-    path = qemu_find_file(QEMU_FILE_TYPE_BIOS, "mac_qfb.rom");
-    if (path == NULL) {
-        /* If we couldn't find the ROM in any of our paths, try the working
-           directory. */
-        path = g_strdup("mac_qfb.rom");
-    }
-    size = get_image_size(path, NULL);
-    if (size < 0) {
-        error_setg(errp, "failed to find romfile \"mac_qfb.rom\"\n");
-    }
-    else if (size == 0) {
-        error_setg(errp, "\"mac_qfb.rom\" is empty\n");
-    }
-    else if (size > NUBUS_DECL_ROM_MAX_SIZE) {
-        error_setg(errp, "\"mac_qfb.rom\" is too large\n");
-    }
-    else {
-        fd = open(path, O_RDONLY | O_BINARY);
-        if (fd < 0) {
-            fprintf(stderr, "Couldn't open \"%s\": %s\n",
-                    path, strerror(errno));
-        }
-        else {
-            memory_region_init_rom(&nd->decl_rom, OBJECT(dev), "qfb-rom",
-                                   size, &error_abort);
-            ptr = memory_region_get_ram_ptr(&nd->decl_rom);
-            if (read(fd, ptr, size) != size) {
-                fprintf(stderr, "Couldn't read \"%s\": %s\n",
-                        path, strerror(errno));
-            }
-            else {
-                memory_region_add_subregion_overlap(&nd->slot_mem,
-                                                    NUBUS_SLOT_SIZE - size,
-                                                    &nd->decl_rom,
-                                                    1);
-                qfb_try_patch_decl_rom(&nd->decl_rom, s);
-            }
-            close(fd);
-        }
-    }
-    g_free(path);
+    qfb_try_patch_decl_rom(&nd->decl_rom, s);
 
     memory_region_init_io(&s->mem_ctrl, OBJECT(dev), &qfb_ctrl_ops, s,
                           "qfb-ctrl", QFB_CTRL_TOPADDR);
@@ -818,6 +779,11 @@ static void qfb_nubus_realize(DeviceState *dev, Error **errp)
     QfbNubusState *s = NUBUS_QFB(dev);
     QfbNubusDeviceClass *ndc = NUBUS_QFB_GET_CLASS(dev);
     QfbState *ms = &s->qfb;
+
+    // Set a default romfile that is included
+    if (!nd->romfile) {
+        nd->romfile = g_strdup("mac_qfb.rom");
+    }
 
     ndc->parent_realize(dev, errp);
     if (*errp) {

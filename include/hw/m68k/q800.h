@@ -48,6 +48,7 @@ struct Q800MachineState {
     MachineState parent_obj;
 
     bool easc;
+    uint8_t banksize[DJMEMC_MAXBANKS];
     M68kCPU cpu;
     MemoryRegion rom;
     MemoryRegion rom_alias;

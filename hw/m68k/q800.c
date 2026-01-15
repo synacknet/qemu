@@ -258,6 +258,7 @@ static void q800_machine_init(MachineState *machine)
     int i, checksum;
     MacFbMode *macfb_mode;
     ram_addr_t ram_size = machine->ram_size;
+    ram_addr_t bank_size = 0;
     const char *kernel_filename = machine->kernel_filename;
     const char *initrd_filename = machine->initrd_filename;
     const char *kernel_cmdline = machine->kernel_cmdline;
@@ -268,6 +269,7 @@ static void q800_machine_init(MachineState *machine)
     SysBusESPState *sysbus_esp;
     ESPState *esp;
     SysBusDevice *sysbus;
+    SysBusDevice *djmemc;
     BusState *adb_bus;
     NubusBus *nubus;
     DriveInfo *dinfo;
@@ -282,24 +284,178 @@ static void q800_machine_init(MachineState *machine)
                      "maximum 1024 MiB", ram_size / MiB);
         exit(1);
     }
+    if (ram_size < 4 * MiB) {
+        error_report("Not enough memory for this machine: %" PRId64 " MiB, "
+                     "minimum 4 MiB", ram_size / MiB);
+        exit(1);
+    }
 
     /* init CPUs */
     object_initialize_child(OBJECT(machine), "cpu", &m->cpu, machine->cpu_type);
     qdev_realize(DEVICE(&m->cpu), NULL, &error_fatal);
     qemu_register_reset(main_cpu_reset, &m->cpu);
 
-    /* RAM */
-    memory_region_init_io(&m->ramio, OBJECT(machine), &ramio_ops, &m->ramio,
-                          "ram", RAM_SIZE);
-    memory_region_add_subregion(get_system_memory(), 0x0, &m->ramio);
-
-    memory_region_add_subregion(&m->ramio, 0, machine->ram);
+    /*
+     * NuBus memory - all inside nubus_mr
+     * 0xFFFFFFFF NuBus nubus_mr                                     -+ nubus_mr
+     * 0xFEFFFFFF MacNuBusBridge                     -+ slot_io alias |
+     * 0xF9FFFFFF NubusDevice slot_mem        -+      |               |
+     * 0xF9800000 - 0xF9800FFF macfb mem_ctl   |      |               |
+     * 0xF9000000 - 0xF93FFFFF macfb mem_vram  |      |               |
+     * 0xF9000000 NubusDevice slot_mem        -+     -+               |
+     *                                                                |
+     * 0xEFFFFFFF MacNuBusBridge                     -+ super_slot_io |
+     * 0x9FFFFFFF NubusDevice super_slot_mem  -+      |               |
+     *   Not used by macfb occupying slot 9    |      |               |
+     * 0x90000000 NubusDevice super_slot_mem  -+      |               |
+     * 0x90000000 MacNuBusBridge super_slot_io alias -+               |
+     * 0x00000000 NuBus nubus_mr                                     -+
+     *
+     * system memory - all inside get_system_memory region
+     * 0xF9000000 - 0xFEFFFFFF NB bridge alias slot    | MacNuBusBridge slot_io
+     * 0x90000000 - 0xEFFFFFFF NB bridge alias super   | MacNuBusBridge super
+     * 0x50040000 - 0x53FFFFFF mac-io.alias            |
+     * 0x5003FFFF                                     -+ mac-io
+     *                                                 |
+     * 0x5001E000 - 0x5001FFFF swim mmio region        |
+     * 0x50018000 - 0x50019FFF iosb mmio region        |
+     * 0x50014000 - 0x50015FFF asc mmio region         |
+     * 0x50010100 - 0x50010103 esp pdma region         |
+     * 0x50010000 - 0x5001003F esp mmio region         |
+     * 0x5000E000 - 0x5000FFFF djmemc mmio region      |
+     * 0x5000C020 - 0x5000C027 escc mmio region        |
+     * 0x5000C000 - 0x5000C007 escc-alias              |
+     * 0x5000A000 - 0x5000A0FF sonic mmio region       |
+     * 0x50008000 - 0x50008FFF sonic prom region       |
+     * 0x50002000 - 0x50003FFF via2 mmio region        |
+     * 0x50000000 - 0x50001FFF via1 mmio region       -+
+     *
+     * 0x40800000 - 0x408FFFFF m68k_mac.rom
+     * 0x40000000 - 0x400FFFFF m68k_mac.rom-alias
+     *
+     * 0x3FFFFFFF                                     -+ ramio
+     * 0x00000000 - ram_size machine->ram              |
+     * 0x00000000                                     -+
+     *
+     * Desired bank behavior:
+     * 0x27FFFFFF bank 8
+     * 0x24000000 - 0x243FFFFF Second 16MiB of a 32MiB SIMM in Slot 3
+     * 0x24000000 bank 8
+     * 0x23FFFFFF bank 8
+     * 0x20000000 - 0x203FFFFF Second 16MiB of a 32MiB SIMM in Slot 3
+     * 0x20000000 bank 8
+     * 0x1FFFFFFF bank 7
+     * 0x1C000000 - 0x1C3FFFFF First 16MiB of a 32MiB SIMM in Slot 4
+     * 0x1C000000 bank 7
+     * 0x1BFFFFFF bank 6
+     * 0x18000000 - 0x183FFFFF First 16MiB of a 32MiB SIMM in Slot 3
+     * 0x18000000 bank 6
+     * 0x17FFFFFF bank 5
+     * 0x14000000 - 0x143FFFFF Second 16MiB of a 32MiB SIMM in Slot 2
+     * 0x14000000 bank 5
+     * 0x13FFFFFF bank 4
+     * 0x10000000 - 0x103FFFFF Second 16MiB of a 32MiB SIMM in Slot 1
+     * 0x10000000 bank 4
+     * 0x0FFFFFFF bank 3
+     * 0x0C000000 - 0x0CFFFFFF First 16MiB of a 32MiB SIMM in Slot 2
+     * 0x0C000000 bank 3
+     * 0x0BFFFFFF bank 2
+     * 0x08000000 - 0x08FFFFFF First 16MiB of a 32MiB SIMM in Slot 1
+     * 0x08000000 bank 2
+     * 0x07FFFFFF bank 1
+     * 0x04000000 - 0x043FFFFF 4MiB soldered onboard
+     * 0x04000000 bank 1
+     * 0x03FFFFFF bank 0
+     * 0x00000000 - 0x003FFFFF 4MiB soldered onboard
+     * 0x00000000 bank 0
+     */
 
     /*
      * Create container for all IO devices
      */
     memory_region_init(&m->macio, OBJECT(machine), "mac-io", IO_SLICE);
     memory_region_add_subregion(get_system_memory(), IO_BASE, &m->macio);
+
+    /* RAM */
+    memory_region_init_io(&m->ramio, OBJECT(machine), &ramio_ops, &m->ramio,
+                          "ram", RAM_SIZE);
+    memory_region_add_subregion(get_system_memory(), 0x0, &m->ramio);
+
+    /* djMEMC memory controller */
+    object_initialize_child(OBJECT(machine), "djmemc", &m->djmemc,
+                            TYPE_DJMEMC);
+    djmemc = SYS_BUS_DEVICE(&m->djmemc);
+    memory_region_add_subregion(&m->macio, DJMEMC_BASE - IO_BASE,
+                                sysbus_mmio_get_region(djmemc, 0));
+    if (m->banksize[0] > 0) {
+        /*
+         * To allow for accurate djMEMC bank emulation, only enable it
+         * if the user has passed in bank size information.
+         * This has the virtue of being disabled by default, as linux
+         * relies on not needing the ROM to run to configure the memory
+         * controller, but also users expect to be able to pass arbitrary
+         * -m # quantities and have it work.  The Q800 ROM will hang
+         * if a bank does not have a power of 2 amount of RAM in it.
+         * The djmemc allows bank sizes up to 64MiB, but the Q800 ROM
+         * will only configure up to 32MiB.
+         * This saves us from taking an arbitrary amount of RAM and
+         * needing to figure out the optimal distribution among banks
+         * that will be configured by the stock Q800 ROM, meet the minimum
+         * bank requirements, and not hang the system.
+         * However, it does allow bank emulation if the user specifies it.
+         */
+
+        /* Validate bank input */
+        for (i = 0; i < DJMEMC_MAXBANKS; i++) {
+            bank_size += (ram_addr_t)m->banksize[i] * MiB;
+            if ((m->banksize[i] & (m->banksize[i] - 1)) != 0) {
+                error_report("Bank %i is configured for %d MiB, "
+                             "but must be a power of 2.", i, m->banksize[i]);
+                exit(1);
+            }
+            if (m->banksize[i] > (DJMEMC_MAXBANK_SIZE / MiB)) {
+                error_report("Bank %i is configured for %d MiB, "
+                             "but cannot exceed %ld MiB", i, m->banksize[i],
+                             DJMEMC_MAXBANK_SIZE / MiB);
+                exit(1);
+            }
+            if (m->banksize[i] > 0 && m->banksize[i] < 4) {
+                error_report("Bank %i is configured for %d MiB, "
+                             "but must be at least 4 MiB", i, m->banksize[i]);
+                exit(1);
+            }
+        }
+        if (bank_size > ram_size) {
+            error_report("Machine RAM is configured for: %" PRId64 " MiB, "
+                         "but total bank configuration is %" PRId64 " MiB.",
+                         ram_size / MiB, bank_size / MiB);
+            exit(1);
+        }
+
+        /* Tell the djmemc how much actual ram is in each bank */
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank0", m->banksize[0]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank1", m->banksize[1]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank2", m->banksize[2]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank3", m->banksize[3]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank4", m->banksize[4]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank5", m->banksize[5]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank6", m->banksize[6]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank7", m->banksize[7]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank8", m->banksize[8]);
+        qdev_prop_set_uint8(DEVICE(&m->djmemc), "bank9", m->banksize[9]);
+
+        sysbus_realize_and_unref(djmemc, &error_fatal);
+
+        /* Map the banks into ramio instead of mapping ram directly */
+        for (i = 0; i < DJMEMC_MAXBANKS; i++) {
+            memory_region_add_subregion(&m->ramio,
+                                        i * DJMEMC_MAXBANK_SIZE,
+                                        sysbus_mmio_get_region(djmemc, i + 1));
+        }
+    } else {
+        sysbus_realize_and_unref(djmemc, &error_fatal);
+        memory_region_add_subregion(&m->ramio, 0, machine->ram);
+    }
 
     /*
      * Memory from IO_BASE to IO_BASE + IO_SLICE is repeated
@@ -321,13 +477,6 @@ static void q800_machine_init(MachineState *machine)
                              &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(&m->glue), &error_fatal);
 
-    /* djMEMC memory controller */
-    object_initialize_child(OBJECT(machine), "djmemc", &m->djmemc,
-                            TYPE_DJMEMC);
-    sysbus = SYS_BUS_DEVICE(&m->djmemc);
-    sysbus_realize_and_unref(sysbus, &error_fatal);
-    memory_region_add_subregion(&m->macio, DJMEMC_BASE - IO_BASE,
-                                sysbus_mmio_get_region(sysbus, 0));
 
     /* IOSB subsystem */
     object_initialize_child(OBJECT(machine), "iosb", &m->iosb, TYPE_IOSB);
@@ -755,6 +904,10 @@ static void q800_set_fb(Object *obj, const char *value, Error **errp)
 static void q800_init(Object *obj)
 {
     Q800MachineState *ms = Q800_MACHINE(obj);
+    const char *bank_description = "Allocated memory in bank. "
+                                   "Must be a power of 2 between 4 and 64. "
+                                   "Total allocation between all banks cannot"
+                                   "exceed machine's configured memory.";
 
     /* Default to EASC */
     ms->easc = true;
@@ -770,6 +923,37 @@ static void q800_init(Object *obj)
                                     "additional qemu framebuffers with e.g. "
                                     "\"-device nubus-qfb,width=640,"
                                     "height=480\".");
+    /* Memory banking configuration */
+    object_property_add_uint8_ptr(obj, "bank0", &ms->banksize[0],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank0", bank_description);
+    object_property_add_uint8_ptr(obj, "bank1", &ms->banksize[1],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank1", bank_description);
+    object_property_add_uint8_ptr(obj, "bank2", &ms->banksize[2],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank2", bank_description);
+    object_property_add_uint8_ptr(obj, "bank3", &ms->banksize[3],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank3", bank_description);
+    object_property_add_uint8_ptr(obj, "bank4", &ms->banksize[4],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank4", bank_description);
+    object_property_add_uint8_ptr(obj, "bank5", &ms->banksize[5],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank5", bank_description);
+    object_property_add_uint8_ptr(obj, "bank6", &ms->banksize[6],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank6", bank_description);
+    object_property_add_uint8_ptr(obj, "bank7", &ms->banksize[7],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank7", bank_description);
+    object_property_add_uint8_ptr(obj, "bank8", &ms->banksize[8],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank8", bank_description);
+    object_property_add_uint8_ptr(obj, "bank9", &ms->banksize[9],
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "bank9", bank_description);
 }
 
 static GlobalProperty hw_compat_q800[] = {

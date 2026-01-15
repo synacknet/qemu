@@ -13,18 +13,27 @@
 #define DJMEMC_SIZE        0x2000
 #define DJMEMC_NUM_REGS    (0x38 / sizeof(uint32_t))
 
-#define DJMEMC_MAXBANKS    10
+#define DJMEMC_MAXBANKS        10
+#define DJMEMC_MAXBANK_SIZE    (64 * MiB)
+
+struct DJMEMCDeviceClass {
+    DeviceClass parent_class;
+
+    DeviceRealize parent_realize;
+};
 
 struct DJMEMCState {
     SysBusDevice parent_obj;
 
     MemoryRegion mem_regs;
+    MemoryRegion banks[DJMEMC_MAXBANKS];
+    uint8_t banksize[DJMEMC_MAXBANKS];   /* amount of populated memory in MiB */
 
     /* Memory controller */
     uint32_t regs[DJMEMC_NUM_REGS];
 };
 
 #define TYPE_DJMEMC "djMEMC"
-OBJECT_DECLARE_SIMPLE_TYPE(DJMEMCState, DJMEMC);
+OBJECT_DECLARE_TYPE(DJMEMCState, DJMEMCDeviceClass, DJMEMC)
 
 #endif

@@ -9,10 +9,13 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/units.h"
 #include "migration/vmstate.h"
 #include "hw/misc/djmemc.h"
 #include "hw/qdev-properties.h"
+#include "hw/boards.h"
 #include "trace.h"
+#include "qapi/error.h"
 
 
 #define DJMEMC_INTERLEAVECONF   0x0
@@ -58,12 +61,28 @@ static void djmemc_write(void *opaque, hwaddr addr, uint64_t val,
                          unsigned size)
 {
     DJMEMCState *s = opaque;
+    int banknum;
 
     trace_djmemc_write(addr, val, size);
 
     switch (addr) {
-    case DJMEMC_INTERLEAVECONF:
     case DJMEMC_BANK0CONF ... DJMEMC_BANK9CONF:
+        if (s->banksize[0] > 0) {
+            banknum = (int)((addr >> 2) - 1);
+            memory_region_set_address(&s->banks[banknum], (val & 0xFF) << 22);
+
+            if (val & 0x100) {
+                /* With bit 8 set, the bank size is limited to 32 MiB */
+                memory_region_set_size(&s->banks[banknum],
+                                  MIN(s->banksize[banknum] * MiB, 32 * MiB));
+            } else {
+                memory_region_set_size(&s->banks[banknum],
+                                  MIN(s->banksize[banknum] * MiB, 64 * MiB));
+            }
+        }
+        s->regs[addr >> 2] = val;
+        break;
+    case DJMEMC_INTERLEAVECONF:
     case DJMEMC_MEMTOP:
     case DJMEMC_CONFIG:
     case DJMEMC_REFRESH:
@@ -85,6 +104,41 @@ static const MemoryRegionOps djmemc_mmio_ops = {
     },
     .endianness = DEVICE_BIG_ENDIAN,
 };
+
+static void djmemc_realize(DeviceState *dev, Error **errp)
+{
+    ERRP_GUARD();
+    DJMEMCState *s = DJMEMC(dev);
+    DJMEMCDeviceClass *ddc = DJMEMC_GET_CLASS(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    MachineState *machine = MACHINE(qdev_get_machine());
+    int i;
+    uint32_t bank_ram_offset = 0;
+
+    ddc->parent_realize(dev, errp);
+    if (*errp) {
+        return;
+    }
+
+    if (s->banksize[0] > 0) {
+        /* assign banks */
+        for (i = 0; i < DJMEMC_MAXBANKS; i++) {
+            char *name = g_strdup_printf("djmemc-bank-%x", i);
+            uint32_t aliassize = s->banksize[i] * MiB;
+
+            s->regs[i + 1] = (i * DJMEMC_MAXBANK_SIZE) >> 22;
+
+            memory_region_init_alias(&s->banks[i],
+                                     OBJECT(dev),
+                                     name,
+                                     machine->ram,
+                                     bank_ram_offset,
+                                     aliassize);
+            sysbus_init_mmio(sbd, &s->banks[i]);
+            bank_ram_offset += aliassize;
+        }
+    }
+}
 
 static void djmemc_init(Object *obj)
 {
@@ -113,13 +167,31 @@ static const VMStateDescription vmstate_djmemc = {
     }
 };
 
+static const Property djmemc_properties[] = {
+    DEFINE_PROP_UINT8("bank0", DJMEMCState, banksize[0], 0),
+    DEFINE_PROP_UINT8("bank1", DJMEMCState, banksize[1], 0),
+    DEFINE_PROP_UINT8("bank2", DJMEMCState, banksize[2], 0),
+    DEFINE_PROP_UINT8("bank3", DJMEMCState, banksize[3], 0),
+    DEFINE_PROP_UINT8("bank4", DJMEMCState, banksize[4], 0),
+    DEFINE_PROP_UINT8("bank5", DJMEMCState, banksize[5], 0),
+    DEFINE_PROP_UINT8("bank6", DJMEMCState, banksize[6], 0),
+    DEFINE_PROP_UINT8("bank7", DJMEMCState, banksize[7], 0),
+    DEFINE_PROP_UINT8("bank8", DJMEMCState, banksize[8], 0),
+    DEFINE_PROP_UINT8("bank9", DJMEMCState, banksize[9], 0),
+};
+
 static void djmemc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ResettableClass *rc = RESETTABLE_CLASS(oc);
+    DJMEMCDeviceClass *ddc = DJMEMC_CLASS(oc);
 
     dc->vmsd = &vmstate_djmemc;
     rc->phases.hold = djmemc_reset_hold;
+
+    device_class_set_parent_realize(dc, djmemc_realize,
+                                    &ddc->parent_realize);
+    device_class_set_props(dc, djmemc_properties);
 }
 
 static const TypeInfo djmemc_info_types[] = {
